@@ -10,10 +10,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # PyTorch + torchaudio, matched versions, for CUDA 12.1.
-# torchaudio is REQUIRED - coqui-tts/XTTS import it, and leaving it out
-# crashed every worker with "No module named 'torchaudio'".
+# - torchaudio is REQUIRED (coqui-tts/XTTS import it).
+# - torch 2.5.1 (NOT 2.4.0): the modern transformers that coqui-tts pulls
+#   imports `DTensor` from torch.distributed.tensor, which only exists in
+#   torch >= 2.5. On torch 2.4 every job crashed with
+#   "cannot import name 'DTensor'". 2.5.1 provides it.
 RUN pip3 install --no-cache-dir \
-    torch==2.4.0 torchaudio==2.4.0 \
+    torch==2.5.1 torchaudio==2.5.1 \
     --index-url https://download.pytorch.org/whl/cu121
 
 # Fail the build EARLY (before the slow 2GB model download) if torchaudio
@@ -23,7 +26,8 @@ RUN python3 -c "import torch, torchaudio; print('TORCH', torch.__version__, 'TOR
 # Pin numpy < 2 (torch/coqui-tts are built against numpy 1.x).
 RUN pip3 install --no-cache-dir "numpy<2"
 
-# Voice cloning + serverless deps (coqui-tts pulls its own transformers).
+# Voice cloning + serverless deps. We let coqui-tts pull its intended
+# transformers (5.x); torch 2.5.1 above provides the DTensor it needs.
 RUN pip3 install --no-cache-dir \
     runpod \
     coqui-tts \
