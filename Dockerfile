@@ -9,8 +9,13 @@ RUN apt-get update && apt-get install -y \
     python3 python3-pip ffmpeg git \
     && rm -rf /var/lib/apt/lists/*
 
-# PyTorch matched to CUDA 12.1.
-RUN pip3 install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# PyTorch matched to CUDA 12.1. IMPORTANT: install torchaudio too - coqui-tts
+# / XTTS import torchaudio to load audio, and leaving it out crashed every
+# worker with "ModuleNotFoundError: No module named 'torchaudio'".
+# torchaudio version MUST match torch (2.4.0 <-> 2.4.0).
+RUN pip3 install --no-cache-dir \
+    torch==2.4.0 torchaudio==2.4.0 \
+    --index-url https://download.pytorch.org/whl/cu121
 
 # CRITICAL: pin numpy < 2. torch 2.4 and coqui-tts are compiled against
 # numpy 1.x; numpy 2.x makes the workers crash at import time with
@@ -37,6 +42,15 @@ snapshot_download('coqui/XTTS-v2', local_dir='/workspace/xtts_v2')"
 
 # Quick sanity check at BUILD time: confirm the model files landed.
 RUN test -f /workspace/xtts_v2/config.json && echo "MODEL OK" || (echo "MODEL MISSING" && exit 1)
+
+# Sanity check at BUILD time: confirm the imports XTTS needs actually work,
+# so a missing module (like torchaudio) fails the build instead of every
+# worker at runtime.
+RUN python3 -c "\
+import torch, torchaudio, numpy; \
+from TTS.tts.configs.xtts_config import XttsConfig; \
+from TTS.tts.models.xtts import Xtts; \
+print('IMPORTS OK torch', torch.__version__, 'torchaudio', torchaudio.__version__, 'numpy', numpy.__version__)"
 
 # Your worker code
 COPY handler.py /workspace/handler.py
