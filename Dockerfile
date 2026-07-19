@@ -26,11 +26,15 @@ RUN python3 -c "import torch, torchaudio; print('TORCH', torch.__version__, 'TOR
 # Pin numpy < 2 (torch/coqui-tts are built against numpy 1.x).
 RUN pip3 install --no-cache-dir "numpy<2"
 
-# Voice cloning + serverless deps. We let coqui-tts pull its intended
-# transformers (5.x); torch 2.5.1 above provides the DTensor it needs.
+# Voice cloning + serverless deps.
+# transformers is pinned to the 4.57 line - the exact version coqui-tts 0.27.5
+# declares it needs (transformers>=4.57). Left unpinned, pip grabs transformers
+# 5.x, which REMOVED `isin_mps_friendly` that coqui-tts imports -> every job
+# crashes. torch 2.5.1 above covers 4.57's DTensor import too.
 RUN pip3 install --no-cache-dir \
     runpod \
     coqui-tts \
+    "transformers>=4.57,<4.58" \
     soundfile
 
 # Re-assert numpy < 2 in case a dependency above bumped it back up.
@@ -41,6 +45,11 @@ RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download
 
 # Confirm the model files landed.
 RUN test -f /workspace/xtts_v2/config.json && echo "MODEL OK" || (echo "MODEL MISSING" && exit 1)
+
+# Import XTTS at BUILD time. If any transformers/torch incompatibility remains
+# (DTensor, isin_mps_friendly, etc.) the BUILD fails here with the real error
+# in the build log - much faster to diagnose than a runtime test + log download.
+RUN python3 -c "from TTS.tts.configs.xtts_config import XttsConfig; from TTS.tts.models.xtts import Xtts; import transformers; print('XTTS IMPORT OK, transformers', transformers.__version__)"
 
 # Your worker code
 COPY handler.py /workspace/handler.py
