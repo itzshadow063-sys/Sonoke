@@ -169,4 +169,4 @@ def handler(event):
 
 
 log("Starting RunPod serverless loop...")
-runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})        
