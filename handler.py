@@ -105,26 +105,35 @@ def chunk_text(text, max_len=220):
 
 
 def upload_audio(path):
+    """Upload the MP3 to YOUR Supabase Storage (reliable) and return a
+    public URL. Needs RunPod env vars SUPABASE_URL + SUPABASE_SERVICE_KEY
+    and a PUBLIC bucket named 'audio'."""
     import requests
-    last = None
-    for attempt in range(3):
-        try:
-            with open(path, "rb") as f:
-                r = requests.post(
-                    "https://catbox.moe/user/api.php",
-                    data={"reqtype": "fileupload"},
-                    files={"fileToUpload": f},
-                    timeout=600,
-                )
-            r.raise_for_status()
-            url = r.text.strip()
-            if url.startswith("http"):
-                return url
-            last = "Upload response: " + url[:200]
-        except Exception as e:
-            last = str(e)
-            log(f"upload attempt {attempt+1} failed: {last}")
-    raise RuntimeError("Upload failed after retries: " + str(last))
+    import uuid
+
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    if not base or not key:
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_KEY not set on RunPod")
+
+    name = "gen-" + uuid.uuid4().hex + ".mp3"
+    with open(path, "rb") as f:
+        data = f.read()
+
+    r = requests.post(
+        f"{base}/storage/v1/object/audio/{name}",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "apikey": key,
+            "Content-Type": "audio/mpeg",
+            "x-upsert": "true",
+        },
+        data=data,
+        timeout=300,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Supabase upload failed {r.status_code}: {r.text[:200]}")
+    return f"{base}/storage/v1/object/public/audio/{name}"
 
 
 def handler(event):
@@ -176,13 +185,13 @@ def handler(event):
             )
 
             size = os.path.getsize(mp3_path)
-            if size < 9_000_000:
+            if size < 1_500_000:  # tiny clips return inline (fast); rest -> Supabase
                 with open(mp3_path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode("utf-8")
                 out_payload = {"audio_b64": audio_b64, "format": "mp3"}
                 log(f"Job complete. inline mp3 ({size} bytes)")
             else:
-                log(f"MP3 is {size} bytes - uploading for a download link...")
+                log(f"MP3 is {size} bytes - uploading to Supabase...")
                 url = upload_audio(mp3_path)
                 out_payload = {"audio_url": url, "format": "mp3"}
                 log(f"Job complete. url={url}")
