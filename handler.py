@@ -40,7 +40,6 @@ def _load_model():
     global _model, _config
     if _model is not None:
         return _model, _config
-
     log("First request - loading XTTS-v2 model...")
     try:
         _orig_load = torch.load
@@ -55,9 +54,7 @@ def _load_model():
         from TTS.tts.models.xtts import Xtts
 
         if not os.path.exists(os.path.join(MODEL_DIR, "config.json")):
-            raise FileNotFoundError(
-                f"{MODEL_DIR}/config.json not found - model was not baked into the image."
-            )
+            raise FileNotFoundError(f"{MODEL_DIR}/config.json not found")
 
         cfg = XttsConfig()
         cfg.load_json(os.path.join(MODEL_DIR, "config.json"))
@@ -76,8 +73,6 @@ def _load_model():
 
 
 def chunk_text(text, max_len=220):
-    """Keep every piece under XTTS's ~400-token limit so long scripts
-    generate fully (not cut off at ~1 minute)."""
     text = (text or "").strip()
     if not text:
         return []
@@ -110,24 +105,29 @@ def chunk_text(text, max_len=220):
 
 
 def upload_audio(path):
-    """Upload big audio to catbox.moe and return its public download URL."""
     import requests
-    with open(path, "rb") as f:
-        r = requests.post(
-            "https://catbox.moe/user/api.php",
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": f},
-            timeout=180,
-        )
-    r.raise_for_status()
-    url = r.text.strip()
-    if not url.startswith("http"):
-        raise RuntimeError("Upload failed: " + url[:200])
-    return url
+    last = None
+    for attempt in range(3):
+        try:
+            with open(path, "rb") as f:
+                r = requests.post(
+                    "https://catbox.moe/user/api.php",
+                    data={"reqtype": "fileupload"},
+                    files={"fileToUpload": f},
+                    timeout=600,
+                )
+            r.raise_for_status()
+            url = r.text.strip()
+            if url.startswith("http"):
+                return url
+            last = "Upload response: " + url[:200]
+        except Exception as e:
+            last = str(e)
+            log(f"upload attempt {attempt+1} failed: {last}")
+    raise RuntimeError("Upload failed after retries: " + str(last))
 
 
 def handler(event):
-    """Returns { "audio_b64": ... } or { "audio_url": ... } or { "error": ... }"""
     try:
         job_input = event["input"]
         voice_b64 = job_input["voice_b64"]
@@ -160,33 +160,28 @@ def handler(event):
             gap = np.zeros(int(0.3 * sr), dtype=np.float32)
             pieces = []
             for i, chunk in enumerate(chunks):
-                result = model.synthesize(
-                    chunk, config, speaker_wav=clean_path, language=lang
-                )
+                result = model.synthesize(chunk, config, speaker_wav=clean_path, language=lang)
                 pieces.append(np.asarray(result["wav"], dtype=np.float32))
                 pieces.append(gap)
                 log(f"  chunk {i+1}/{len(chunks)} done")
 
             full_audio = np.concatenate(pieces)
-            sf.write(out_path, full_audio, sr)  # WAV
+            sf.write(out_path, full_audio, sr)
 
-            # Convert to MP3 (much smaller than WAV).
             mp3_path = os.path.join(tmp, "output.mp3")
             subprocess.run(
                 ["ffmpeg", "-y", "-loglevel", "error", "-i", out_path,
-                 "-b:a", "64k", mp3_path],
+                 "-b:a", "48k", mp3_path],
                 check=True,
             )
 
             size = os.path.getsize(mp3_path)
-            if size < 7_000_000:
-                # small enough to return directly (fast)
+            if size < 9_000_000:
                 with open(mp3_path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode("utf-8")
                 out_payload = {"audio_b64": audio_b64, "format": "mp3"}
                 log(f"Job complete. inline mp3 ({size} bytes)")
             else:
-                # too big for RunPod to return inline -> upload, send a link
                 log(f"MP3 is {size} bytes - uploading for a download link...")
                 url = upload_audio(mp3_path)
                 out_payload = {"audio_url": url, "format": "mp3"}
