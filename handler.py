@@ -1,21 +1,5 @@
 """
 RunPod Serverless worker for Sonoke voice cloning.
-
-How this fits in:
-    Website  --(JSON: base64 voice sample + script + language)-->  RunPod API
-        --> THIS FILE runs on a GPU worker that RunPod spins up automatically
-        --> returns JSON: base64 of the generated WAV
-        --> worker goes back to sleep (you stop paying)
-
-Design notes:
-    - Every startup step prints LOUDLY with flush=True, so if a worker
-      crashes we can see exactly which line failed in the RunPod logs.
-    - The heavy model load is wrapped in try/except that prints the full
-      traceback before re-raising. (Previously a silent top-level crash gave
-      us "exit code 1" with no explanation.)
-    - The model loads LAZILY on the first request, not at import time. This
-      means the container starts healthy immediately, and any model problem
-      shows up as a clean job error instead of an unhealthy worker.
 """
 
 import base64
@@ -48,9 +32,6 @@ except Exception:
     raise
 
 
-# ----------------------------------------------------------------------
-# Model is loaded lazily (on first job) so the worker starts healthy.
-# ----------------------------------------------------------------------
 MODEL_DIR = "/workspace/xtts_v2"
 _model = None
 _config = None
@@ -63,9 +44,6 @@ def _load_model():
         return _model, _config
 
     log("First request - loading XTTS-v2 model...")
-
-    # PyTorch 2.6+ defaults torch.load to weights_only=True which breaks
-    # XTTS checkpoints. Force it off using the ORIGINAL loader (no recursion).
     try:
         _orig_load = torch.load
 
@@ -80,8 +58,7 @@ def _load_model():
 
         if not os.path.exists(os.path.join(MODEL_DIR, "config.json")):
             raise FileNotFoundError(
-                f"{MODEL_DIR}/config.json not found - model was not baked "
-                f"into the image. Contents: {os.listdir(MODEL_DIR) if os.path.isdir(MODEL_DIR) else 'DIR MISSING'}"
+                f"{MODEL_DIR}/config.json not found - model was not baked into the image."
             )
 
         cfg = XttsConfig()
@@ -100,21 +77,42 @@ def _load_model():
         raise
 
 
-# ----------------------------------------------------------------------
-# The handler - runs once per incoming job
-# ----------------------------------------------------------------------
+def chunk_text(text, max_len=220):
+    """Keep every piece under XTTS's ~400-token limit so long scripts
+    generate fully (not cut off at ~1 minute)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks, cur = [], ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > max_len:
+            if cur:
+                chunks.append(cur.strip()); cur = ""
+            piece = ""
+            for w in s.split():
+                if len(piece) + len(w) + 1 > max_len:
+                    if piece:
+                        chunks.append(piece.strip())
+                    piece = w
+                else:
+                    piece = (piece + " " + w).strip()
+            if piece:
+                chunks.append(piece.strip())
+        elif len(cur) + len(s) + 1 > max_len:
+            chunks.append(cur.strip()); cur = s
+        else:
+            cur = (cur + " " + s).strip()
+    if cur:
+        chunks.append(cur.strip())
+    return [c for c in chunks if c]
+
+
 def handler(event):
-    """
-    Expected event["input"]:
-        {
-          "voice_b64": "<base64-encoded audio file (mp3/wav)>",
-          "voice_ext": "mp3",
-          "script": "text to speak",
-          "lang": "en"
-        }
-    Returns: { "audio_b64": "<base64-encoded WAV output>" }
-    or on error: { "error": "<message>" }
-    """
+    """Returns { "audio_b64": ... } or { "error": ... }"""
     try:
         job_input = event["input"]
         voice_b64 = job_input["voice_b64"]
@@ -132,28 +130,27 @@ def handler(event):
             with open(raw_path, "wb") as f:
                 f.write(base64.b64decode(voice_b64))
 
-            # normalize the uploaded sample to what XTTS wants
             subprocess.run(
                 ["ffmpeg", "-y", "-loglevel", "error", "-i", raw_path,
                  "-ar", "22050", "-ac", "1", clean_path],
                 check=True,
             )
 
-            # sentence-chunk (XTTS caps ~400 tokens/call) then synthesize
-            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", script.strip()) if s.strip()]
-            if not sentences:
-                sentences = [script.strip()]
+            chunks = chunk_text(script, max_len=220)
+            if not chunks:
+                chunks = [script.strip()]
 
-            log(f"Synthesizing {len(sentences)} sentence(s), lang={lang}")
+            log(f"Synthesizing {len(chunks)} chunk(s), lang={lang}")
             sr = 24000
             gap = np.zeros(int(0.3 * sr), dtype=np.float32)
             pieces = []
-            for i, sentence in enumerate(sentences):
+            for i, chunk in enumerate(chunks):
                 result = model.synthesize(
-                    sentence, config, speaker_wav=clean_path, language=lang
+                    chunk, config, speaker_wav=clean_path, language=lang
                 )
                 pieces.append(np.asarray(result["wav"], dtype=np.float32))
                 pieces.append(gap)
+                log(f"  chunk {i+1}/{len(chunks)} done")
 
             full_audio = np.concatenate(pieces)
             sf.write(out_path, full_audio, sr)
