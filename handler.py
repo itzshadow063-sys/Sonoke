@@ -12,7 +12,6 @@ import traceback
 
 
 def log(msg):
-    """Print with an immediate flush so RunPod captures it even on crash."""
     print(f"[sonoke] {msg}", flush=True)
 
 
@@ -38,7 +37,6 @@ _config = None
 
 
 def _load_model():
-    """Load XTTS-v2 once, cache it in module globals."""
     global _model, _config
     if _model is not None:
         return _model, _config
@@ -111,8 +109,25 @@ def chunk_text(text, max_len=220):
     return [c for c in chunks if c]
 
 
+def upload_audio(path):
+    """Upload big audio to catbox.moe and return its public download URL."""
+    import requests
+    with open(path, "rb") as f:
+        r = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": f},
+            timeout=180,
+        )
+    r.raise_for_status()
+    url = r.text.strip()
+    if not url.startswith("http"):
+        raise RuntimeError("Upload failed: " + url[:200])
+    return url
+
+
 def handler(event):
-    """Returns { "audio_b64": ... } or { "error": ... }"""
+    """Returns { "audio_b64": ... } or { "audio_url": ... } or { "error": ... }"""
     try:
         job_input = event["input"]
         voice_b64 = job_input["voice_b64"]
@@ -153,13 +168,31 @@ def handler(event):
                 log(f"  chunk {i+1}/{len(chunks)} done")
 
             full_audio = np.concatenate(pieces)
-            sf.write(out_path, full_audio, sr)
+            sf.write(out_path, full_audio, sr)  # WAV
 
-            with open(out_path, "rb") as f:
-                audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+            # Convert to MP3 (much smaller than WAV).
+            mp3_path = os.path.join(tmp, "output.mp3")
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", out_path,
+                 "-b:a", "64k", mp3_path],
+                check=True,
+            )
 
-        log("Job complete.")
-        return {"audio_b64": audio_b64}
+            size = os.path.getsize(mp3_path)
+            if size < 7_000_000:
+                # small enough to return directly (fast)
+                with open(mp3_path, "rb") as f:
+                    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+                out_payload = {"audio_b64": audio_b64, "format": "mp3"}
+                log(f"Job complete. inline mp3 ({size} bytes)")
+            else:
+                # too big for RunPod to return inline -> upload, send a link
+                log(f"MP3 is {size} bytes - uploading for a download link...")
+                url = upload_audio(mp3_path)
+                out_payload = {"audio_url": url, "format": "mp3"}
+                log(f"Job complete. url={url}")
+
+        return out_payload
 
     except Exception as e:
         log("Job failed")
@@ -169,4 +202,4 @@ def handler(event):
 
 
 log("Starting RunPod serverless loop...")
-runpod.serverless.start({"handler": handler})        
+runpod.serverless.start({"handler": handler})
