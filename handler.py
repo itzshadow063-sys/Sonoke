@@ -105,9 +105,8 @@ def chunk_text(text, max_len=220):
 
 
 def upload_audio(path):
-    """Upload the MP3 to YOUR Supabase Storage (reliable) and return a
-    public URL. Needs RunPod env vars SUPABASE_URL + SUPABASE_SERVICE_KEY
-    and a PUBLIC bucket named 'audio'."""
+    """Upload the MP3 to YOUR Supabase Storage and return a public URL.
+    Needs RunPod env vars SUPABASE_URL + SUPABASE_SERVICE_KEY and a PUBLIC bucket 'audio'."""
     import requests
     import uuid
 
@@ -142,7 +141,17 @@ def handler(event):
         voice_b64 = job_input["voice_b64"]
         voice_ext = job_input.get("voice_ext", "mp3")
         script = job_input["script"]
+
+        # Language safety: XTTS-v2 supports only these 17. Anything else
+        # (e.g. Urdu 'ur') would crash the tokenizer, so fall back safely.
+        XTTS_LANGS = {"en","es","fr","de","it","pt","pl","tr","ru","nl",
+                      "cs","ar","zh-cn","ja","hu","ko","hi"}
+        LANG_FALLBACK = {"ur": "hi"}
         lang = job_input.get("lang", "en")
+        lang = LANG_FALLBACK.get(lang, lang)
+        if lang not in XTTS_LANGS:
+            log(f"Language '{lang}' unsupported - falling back to English")
+            lang = "en"
 
         model, config = _load_model()
 
@@ -168,11 +177,21 @@ def handler(event):
             sr = 24000
             gap = np.zeros(int(0.3 * sr), dtype=np.float32)
             pieces = []
+            failed = 0
             for i, chunk in enumerate(chunks):
-                result = model.synthesize(chunk, config, speaker_wav=clean_path, language=lang)
-                pieces.append(np.asarray(result["wav"], dtype=np.float32))
-                pieces.append(gap)
-                log(f"  chunk {i+1}/{len(chunks)} done")
+                try:
+                    result = model.synthesize(chunk, config, speaker_wav=clean_path, language=lang)
+                    pieces.append(np.asarray(result["wav"], dtype=np.float32))
+                    pieces.append(gap)
+                    log(f"  chunk {i+1}/{len(chunks)} done")
+                except Exception as ce:
+                    failed += 1
+                    log(f"  chunk {i+1}/{len(chunks)} FAILED, skipping: {ce}")
+
+            if not pieces:
+                return {"error": f"Could not generate audio - all {len(chunks)} chunks failed. Try simpler text or another language."}
+            if failed:
+                log(f"NOTE: {failed}/{len(chunks)} chunks skipped.")
 
             full_audio = np.concatenate(pieces)
             sf.write(out_path, full_audio, sr)
@@ -185,13 +204,13 @@ def handler(event):
             )
 
             size = os.path.getsize(mp3_path)
-            if size < 1_500_000:  # tiny clips return inline (fast); rest -> Supabase
+            if size < 1_500_000:
                 with open(mp3_path, "rb") as f:
                     audio_b64 = base64.b64encode(f.read()).decode("utf-8")
                 out_payload = {"audio_b64": audio_b64, "format": "mp3"}
                 log(f"Job complete. inline mp3 ({size} bytes)")
             else:
-                log(f"MP3 is {size} bytes - uploading to Supabase...")
+                log(f"MP3 is {size} bytes - uploading for a download link...")
                 url = upload_audio(mp3_path)
                 out_payload = {"audio_url": url, "format": "mp3"}
                 log(f"Job complete. url={url}")
